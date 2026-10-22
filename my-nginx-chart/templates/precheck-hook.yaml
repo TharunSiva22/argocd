@@ -1,0 +1,131 @@
+{{- if .Values.precheck.enabled }}
+{{- if .Values.precheck.enabled }}
+# --- RBAC for the hook (created first, weight -10) ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-precheck
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-precheck
+  namespace: kube-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "deployments/scale"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-precheck
+  namespace: kube-system
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-precheck
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-precheck
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-precheck
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-precheck
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-precheck
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-precheck
+    namespace: {{ .Release.Namespace }}
+---
+# --- The actual check-and-act Job (weight 0, runs after RBAC exists) ---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-precheck
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  template:
+    spec:
+      serviceAccountName: {{ .Release.Name }}-precheck
+      restartPolicy: Never
+      containers:
+        - name: precheck
+          image: alpine/k8s:1.31.0
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              NS="{{ .Release.Namespace }}"
+              CTRL="{{ .Values.precheck.controller }}"
+
+              echo "CHECK 1: does the controller deployment exist?"
+              kubectl -n kube-system get deploy "$CTRL" >/dev/null \
+                || { echo "FAIL: $CTRL not found in kube-system"; exit 1; }
+
+              echo "CHECK 2: is it scaled up?"
+              REPLICAS=$(kubectl -n kube-system get deploy "$CTRL" -o jsonpath='{.spec.replicas}')
+              if [ "$REPLICAS" -eq 0 ]; then
+                echo "ACTION: scaled to 0, scaling up to 2"
+                kubectl -n kube-system scale deploy "$CTRL" --replicas=2
+              fi
+
+              echo "CHECK 3: wait up to 120s for the controller to be Available"
+              kubectl -n kube-system wait --for=condition=Available deploy/"$CTRL" --timeout=120s \
+                || { echo "FAIL: controller not available, aborting release"; exit 1; }
+
+              echo "ACTION: record the result in a ConfigMap"
+              kubectl -n "$NS" create configmap {{ .Release.Name }}-precheck-status \
+                --from-literal=controller=ready \
+                --from-literal=checkedAt="$(date -u +%FT%TZ)" \
+                --dry-run=client -o yaml | kubectl apply -f -
+
+              echo "Pre-check passed, Helm will now continue."
+{{- end }}
+{{- end }}
